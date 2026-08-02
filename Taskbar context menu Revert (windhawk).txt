@@ -1,0 +1,191 @@
+// ==WindhawkMod==
+// @id            kill-movetaskbarcontextmenucontrolstosettingsapp
+// @name          Restore Taskbar Context Menu Controls
+// @description   Restores the taskbar context menu entries, which were removed/sent to the settings app after build 21370
+// @author        Tails
+// @github        github.com/milestprower92
+// @include       explorer.exe
+// @compilerOptions -lversion
+// ==/WindhawkMod==
+
+#include <windhawk_api.h>
+#include <windows.h>
+#include <winreg.h>
+
+#define IDM_SHOW_TASKVIEW       430
+#define IDM_SHOW_SEARCH         431
+#define IDM_SHOW_CORTANA        449
+#define IDM_SHOW_PEOPLE         435
+#define IDM_SHOW_TOUCHKEYBOARD  436
+#define IDM_SHOW_PEN            437
+#define IDM_SHOW_TOUCHPAD       438
+#define IDM_SEARCH_HIDDEN       432 
+#define IDM_SEARCH_ICON         433
+#define IDM_SEARCH_BOX          434
+
+bool g_ProtectCortanaPeople = false;
+DWORD GetRegistryDword(HKEY hKey, LPCWSTR subKey, LPCWSTR valueName, DWORD defaultValue) {
+    DWORD data = defaultValue;
+    DWORD dataSize = sizeof(data);
+    if (RegGetValueW(hKey, subKey, valueName, RRF_RT_REG_DWORD, nullptr, &data, &dataSize) == ERROR_SUCCESS) {
+        return data;
+    }
+    return defaultValue;
+}
+
+bool IsTargetItem(UINT id) {
+    if (id == IDM_SHOW_TASKVIEW || 
+        id == IDM_SHOW_SEARCH || 
+        id == IDM_SHOW_TOUCHKEYBOARD || 
+        id == IDM_SHOW_PEN || 
+        id == IDM_SHOW_TOUCHPAD) {
+        return true;
+    }
+    if (g_ProtectCortanaPeople && (id == IDM_SHOW_CORTANA || id == IDM_SHOW_PEOPLE)) {
+        return true;
+    }
+    return false;
+}
+void ApplyForcedCheckmarks(UINT id, MENUITEMINFOW& mii) {
+    mii.fMask |= MIIM_STATE;
+    if (IsTargetItem(id)) {
+        mii.fState &= ~MFS_DISABLED;
+        mii.fState &= ~MFS_GRAYED;
+        mii.fState |= MFS_ENABLED;
+    }
+    if (id == IDM_SHOW_CORTANA) {
+        DWORD val = GetRegistryDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", L"ShowCortanaButton", 0);
+        if (val == 1) mii.fState |= MFS_CHECKED; else mii.fState &= ~MFS_CHECKED;
+    }
+    else if (id == IDM_SHOW_TASKVIEW) {
+        DWORD val = GetRegistryDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", L"ShowTaskViewButton", 0);
+        if (val == 1) mii.fState |= MFS_CHECKED; else mii.fState &= ~MFS_CHECKED;
+    }
+    else if (id == IDM_SHOW_PEOPLE) {
+        DWORD val = GetRegistryDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\People", L"PeopleBand", 0);
+        if (val == 1) mii.fState |= MFS_CHECKED; else mii.fState &= ~MFS_CHECKED;
+    }
+    else if (id == IDM_SEARCH_HIDDEN || id == IDM_SEARCH_ICON || id == IDM_SEARCH_BOX) {
+        DWORD searchMode = GetRegistryDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Search", L"SearchboxTaskbarMode", 0);
+        mii.fState &= ~MFS_CHECKED;
+        if (id == IDM_SEARCH_HIDDEN && searchMode == 0) mii.fState |= MFS_CHECKED;
+        else if (id == IDM_SEARCH_ICON && (searchMode == 1 || searchMode == 3)) mii.fState |= MFS_CHECKED;
+        else if (id == IDM_SEARCH_BOX && searchMode == 2) mii.fState |= MFS_CHECKED;
+    }
+}
+bool IsExplorerVersionValid() {
+    WCHAR exePath[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exePath, MAX_PATH)) return false;
+    HMODULE hVersion = LoadLibraryW(L"version.dll");
+    if (!hVersion) return false;
+    typedef DWORD (WINAPI *GetFileVersionInfoSizeW_t)(LPCWSTR, LPDWORD);
+    typedef BOOL (WINAPI *GetFileVersionInfoW_t)(LPCWSTR, DWORD, DWORD, LPVOID);
+    typedef BOOL (WINAPI *VerQueryValueW_t)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+    auto pGetFileVersionInfoSizeW = (GetFileVersionInfoSizeW_t)GetProcAddress(hVersion, "GetFileVersionInfoSizeW");
+    auto pGetFileVersionInfoW = (GetFileVersionInfoW_t)GetProcAddress(hVersion, "GetFileVersionInfoW");
+    auto pVerQueryValueW = (VerQueryValueW_t)GetProcAddress(hVersion, "VerQueryValueW");
+    if (!pGetFileVersionInfoSizeW || !pGetFileVersionInfoW || !pVerQueryValueW) {
+        FreeLibrary(hVersion);
+        return false;
+    }
+    DWORD dummy;
+    DWORD size = pGetFileVersionInfoSizeW(exePath, &dummy);
+    if (size == 0) { FreeLibrary(hVersion); return false; }
+    void* versionInfo = malloc(size);
+    if (!versionInfo) { FreeLibrary(hVersion); return false; }
+    if (!pGetFileVersionInfoW(exePath, 0, size, versionInfo)) { free(versionInfo); FreeLibrary(hVersion); return false; }
+    VS_FIXEDFILEINFO* fileInfo = nullptr;
+    UINT len = 0;
+    if (!pVerQueryValueW(versionInfo, L"\\", (void**)&fileInfo, &len)) { free(versionInfo); FreeLibrary(hVersion); return false; }
+    WORD major = HIWORD(fileInfo->dwFileVersionMS);
+    WORD minor = LOWORD(fileInfo->dwFileVersionMS);
+    WORD build = HIWORD(fileInfo->dwFileVersionLS);
+    free(versionInfo); FreeLibrary(hVersion);
+    if (major > 10) return true;
+    if (major == 10) {
+        if (minor > 0) return true;
+        if (minor == 0 && build >= 21370) return true;
+    }
+    return false;
+}
+typedef BOOL(WINAPI *DeleteMenu_t)(HMENU hMenu, UINT uPosition, UINT uFlags);
+DeleteMenu_t DeleteMenu_Original;
+BOOL WINAPI DeleteMenu_Hook(HMENU hMenu, UINT uPosition, UINT uFlags) {
+    if (!(uFlags & MF_BYPOSITION) && IsTargetItem(uPosition)) return TRUE;
+    return DeleteMenu_Original(hMenu, uPosition, uFlags);
+}
+
+typedef BOOL(WINAPI *RemoveMenu_t)(HMENU hMenu, UINT uPosition, UINT uFlags);
+RemoveMenu_t RemoveMenu_Original;
+BOOL WINAPI RemoveMenu_Hook(HMENU hMenu, UINT uPosition, UINT uFlags) {
+    if (!(uFlags & MF_BYPOSITION) && IsTargetItem(uPosition)) return TRUE;
+    return RemoveMenu_Original(hMenu, uPosition, uFlags);
+}
+
+typedef BOOL(WINAPI *EnableMenuItem_t)(HMENU hMenu, UINT uIDEnableItem, UINT uEnable);
+EnableMenuItem_t EnableMenuItem_Original;
+BOOL WINAPI EnableMenuItem_Hook(HMENU hMenu, UINT uIDEnableItem, UINT uEnable) {
+    if (!(uEnable & MF_BYPOSITION) && IsTargetItem(uIDEnableItem)) {
+        uEnable &= ~MF_DISABLED;
+        uEnable &= ~MF_GRAYED;
+        uEnable |= MF_ENABLED;
+    }
+    return EnableMenuItem_Original(hMenu, uIDEnableItem, uEnable);
+}
+
+BOOL Wh_ModInit() {
+    Wh_Log(L"Checking Explorer version...");
+    
+    if (!IsExplorerVersionValid()) {
+        Wh_Log(L"Explorer version is less than 10.0.21370. Mod disabled.");
+        return FALSE;
+    }
+    Wh_Log(L"Explorer version compatible (>= 10.0.21370).");
+    bool isWin11OrHigher = false;
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        typedef NTSTATUS(WINAPI *RtlGetVersion_t)(PRTL_OSVERSIONINFOW);
+        auto pRtlGetVersion = (RtlGetVersion_t)GetProcAddress(hNtdll, "RtlGetVersion");
+        if (pRtlGetVersion) {
+            RTL_OSVERSIONINFOW rovi = { 0 };
+            rovi.dwOSVersionInfoSize = sizeof(rovi);
+            if (pRtlGetVersion(&rovi) == 0) {
+                if (rovi.dwBuildNumber >= 22000) {
+                    isWin11OrHigher = true;
+                }
+            }
+        }
+    }
+
+    bool hasDxgiInSystemRoot = false;
+    WCHAR dxgiPath[MAX_PATH];
+    if (GetEnvironmentVariableW(L"SystemRoot", dxgiPath, MAX_PATH) > 0) {
+        lstrcatW(dxgiPath, L"\\dxgi.dll");
+        if (GetFileAttributesW(dxgiPath) != INVALID_FILE_ATTRIBUTES) {
+            hasDxgiInSystemRoot = true;
+        }
+    }
+
+    g_ProtectCortanaPeople = (isWin11OrHigher && hasDxgiInSystemRoot);
+    if (g_ProtectCortanaPeople) {
+        Wh_Log(L"Windows 11+ and %SystemRoot%\\dxgi.dll detected. Protecting Cortana and People buttons from ExplorerPatcher.");
+    }
+    
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    if (!hUser32) {
+        Wh_Log(L"Failed to get handle for user32.dll");
+        return FALSE;
+    }
+    
+    void* pDeleteMenu = (void*)GetProcAddress(hUser32, "DeleteMenu");
+    if (pDeleteMenu) Wh_SetFunctionHook(pDeleteMenu, (void*)DeleteMenu_Hook, (void**)&DeleteMenu_Original);
+    
+    void* pRemoveMenu = (void*)GetProcAddress(hUser32, "RemoveMenu");
+    if (pRemoveMenu) Wh_SetFunctionHook(pRemoveMenu, (void*)RemoveMenu_Hook, (void**)&RemoveMenu_Original);
+    
+    void* pEnableMenuItem = (void*)GetProcAddress(hUser32, "EnableMenuItem");
+    if (pEnableMenuItem) Wh_SetFunctionHook(pEnableMenuItem, (void*)EnableMenuItem_Hook, (void**)&EnableMenuItem_Original);
+
+    Wh_Log(L"Menu hooks installed successfully.");
+    return TRUE;
+}
