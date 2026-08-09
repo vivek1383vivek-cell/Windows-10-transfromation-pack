@@ -1,0 +1,162 @@
+// ==WindhawkMod==
+// @id            win11-legacy-win10taskbar-backdrop-fork
+// @name          Windows 11 Legacy Taskbar Backdrop - Fork
+// @description   Reverts the Taskbar acrylic on the leftover Windows 10 taskbar on Windows 11
+// @author        Tails
+// @include       explorer.exe
+// @compilerOptions -luser32 -ladvapi32
+// ==/WindhawkMod==
+
+// ==WindhawkModSettings==
+/*
+- Use1507Backdrop: false
+  $name: Use Pre-1803 backdrop
+  $description: makes the taskbar use plain transparency instead of acrylic, like it was before Windows 10 1803
+*/
+// ==/WindhawkModSettings==
+
+#include <windows.h>
+#include <windhawk_api.h>
+
+bool g_useTransparentGradient = false;
+
+typedef enum _ACCENT_STATE {
+    ACCENT_DISABLED = 0,
+    ACCENT_ENABLE_GRADIENT = 1,
+    ACCENT_ENABLE_TRANSPARENTGRADIENT = 2,
+    ACCENT_ENABLE_BLURBEHIND = 3,
+    ACCENT_ENABLE_ACRYLICBLURBEHIND = 4,
+    ACCENT_ENABLE_HOSTBACKDROP = 5,
+    ACCENT_INVALID_STATE = 6
+} ACCENT_STATE;
+
+typedef struct _ACCENT_POLICY {
+    ACCENT_STATE AccentState;
+    DWORD AccentFlags;
+    DWORD GradientColor;
+    DWORD AnimationId;
+} ACCENT_POLICY;
+
+typedef enum _WINDOWCOMPOSITIONATTRIB {
+    WCA_ACCENT_POLICY = 19
+} WINDOWCOMPOSITIONATTRIB;
+
+typedef struct _WINDOWCOMPOSITIONATTRIBDATA {
+    WINDOWCOMPOSITIONATTRIB Attrib;
+    PVOID pvData;
+    SIZE_T cbData;
+} WINDOWCOMPOSITIONATTRIBDATA;
+
+typedef BOOL(WINAPI *SetWindowCompositionAttribute_t)(HWND hwnd, WINDOWCOMPOSITIONATTRIBDATA* data);
+SetWindowCompositionAttribute_t SetWindowCompositionAttribute_Original;
+
+struct ThemeState {
+    bool isLightTheme;
+    bool useAccentColor;
+    DWORD accentColorABGR;
+};
+
+ThemeState GetCurrentThemeState() {
+    ThemeState state = {false, false, 0};
+    HKEY hKey;
+    DWORD val = 0;
+    DWORD dataSize = sizeof(DWORD);
+    
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(hKey, L"SystemUsesLightTheme", nullptr, nullptr, (LPBYTE)&val, &dataSize) == ERROR_SUCCESS) {
+            state.isLightTheme = (val != 0);
+        }
+        
+        dataSize = sizeof(DWORD);
+        if (RegQueryValueExW(hKey, L"ColorPrevalence", nullptr, nullptr, (LPBYTE)&val, &dataSize) == ERROR_SUCCESS) {
+            state.useAccentColor = (val != 0);
+        }
+        RegCloseKey(hKey);
+    }
+    
+    if (state.useAccentColor) {
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\DWM", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            DWORD colorization = 0;
+            dataSize = sizeof(DWORD);
+            if (RegQueryValueExW(hKey, L"ColorizationColor", nullptr, nullptr, (LPBYTE)&colorization, &dataSize) == ERROR_SUCCESS) {
+                BYTE r = (colorization >> 16) & 0xE7;
+                BYTE g = (colorization >> 8) & 0xE7;
+                BYTE b = colorization & 0xE7;
+                float darknessFactor = 0.8f; 
+                r = (BYTE)(r * darknessFactor);
+                g = (BYTE)(g * darknessFactor);
+                b = (BYTE)(b * darknessFactor);
+                BYTE a = 0xDD;
+                state.accentColorABGR = (a << 24) | (b << 16) | (g << 8) | r;
+            }
+            RegCloseKey(hKey);
+        }
+    }
+    return state;
+}
+
+BOOL WINAPI SetWindowCompositionAttribute_Hook(HWND hwnd, WINDOWCOMPOSITIONATTRIBDATA* data) {
+    if (data && data->Attrib == WCA_ACCENT_POLICY && data->pvData) {
+        ACCENT_POLICY* policy = (ACCENT_POLICY*)data->pvData;
+        if (policy->AccentState == ACCENT_ENABLE_ACRYLICBLURBEHIND || 
+            policy->AccentState == ACCENT_ENABLE_BLURBEHIND) {
+            WCHAR className[256];
+            if (GetClassNameW(hwnd, className, ARRAYSIZE(className))) {
+                if (wcscmp(className, L"Shell_TrayWnd") == 0 || 
+                    wcscmp(className, L"SecondaryTrayWnd") == 0) {
+                    ThemeState theme = GetCurrentThemeState();
+                    
+                    if (g_useTransparentGradient) {
+                        policy->AccentState = ACCENT_ENABLE_TRANSPARENTGRADIENT;
+                    } else {
+                        policy->AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND;
+                    }
+                    if (theme.useAccentColor && theme.accentColorABGR != 0) {
+                        policy->GradientColor = theme.accentColorABGR;
+                    } 
+                    else if (theme.isLightTheme) {
+                        policy->GradientColor = 0xCCFFFFFF;
+                    } 
+                    else {
+                        policy->GradientColor = 0xCC000000;
+                    }
+                }
+            }
+        }
+    }
+    return SetWindowCompositionAttribute_Original(hwnd, data);
+}
+
+void LoadSettings() {
+    g_useTransparentGradient = Wh_GetIntSetting(L"Use1507Backdrop") != 0;
+}
+void Wh_ModSettingsChanged() {
+    LoadSettings();
+    Wh_Log(L"Settings updated.");
+}
+
+BOOL Wh_ModInit() {
+    LoadSettings();
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) {
+        Wh_Log(L"Failed to load user32.dll");
+        return FALSE;
+    }
+    
+    void* SetWindowCompositionAttribute_Addr = (void*)GetProcAddress(user32, "SetWindowCompositionAttribute");
+    if (!SetWindowCompositionAttribute_Addr) {
+        Wh_Log(L"Failed to find SetWindowCompositionAttribute");
+        return FALSE;
+    }
+
+    Wh_SetFunctionHook(SetWindowCompositionAttribute_Addr, 
+                       (void*)SetWindowCompositionAttribute_Hook, 
+                       (void**)&SetWindowCompositionAttribute_Original);
+                       
+    Wh_Log(L"Successfully hooked SetWindowCompositionAttribute");
+    return TRUE;
+}
+
+void Wh_ModUninit() {
+    Wh_Log(L"Mod uninitialized!");
+}
